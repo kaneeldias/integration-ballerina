@@ -3,15 +3,9 @@ import ballerinax/googleapis.gmail as gmail;
 import ballerina/mime;
 import ballerinax/salesforce as sfdc;
 import ballerina/lang.runtime;
-
-type GmailOAuth2Config record {|
-    string refreshToken;
-    string clientId;
-    string clientSecret;
-|};
+import ballerinax/openai.chat as openAI;
 
 configurable GmailOAuth2Config gmailOAuth2Config = ?;
-
 gmail:ConnectionConfig gmailConfig = {
     auth: {
         refreshUrl: gmail:REFRESH_URL,
@@ -21,16 +15,7 @@ gmail:ConnectionConfig gmailConfig = {
     }
 };
 
-type SalesforceOAuth2Config record {|
-    string clientId;
-    string clientSecret;
-    string refreshToken;
-    string baseUrl;
-    string refreshUrl;
-|};
-
 configurable SalesforceOAuth2Config salesforceOAuth2Config = ?;
-
 sfdc:ConnectionConfig sfdcConfig = {
     baseUrl: salesforceOAuth2Config.baseUrl,
     auth: {
@@ -41,59 +26,73 @@ sfdc:ConnectionConfig sfdcConfig = {
     }
 };
 
-type Email record {|
-    string 'from;
-    string subject;
-    string body;
-|};
+configurable string openAIKey = ?;
 
-type Name record {|
-    string firstName__c;
-    string lastName__c;
-|};
-
-type Lead record {|
-    *Name;
-    string email__c;
-    string phoneNumber__c;
-    string company__c;
-    string designation__c;
-|};
+final string label = "Lead";
 
 public function main() returns error? {
     while true {
+        Email[] emails = check getEmails(label);
+
+        Lead[] leads = [];
+        from Email email in emails
+        do {
+            Lead|error lead = generateLead(email.'from, email.subject, email.body);
+            if lead is Lead {
+                leads.push(lead);
+            }
+        };
+
+        check addLeadsToSalesforce(leads);
+
         runtime:sleep(10);
-        check checkForNewLeads();
     }
 }
 
-function checkForNewLeads() returns error? {
-    sfdc:Client|error sfdcClient = new (sfdcConfig);
-    if sfdcClient is error {
-        log:printError("An error occured while initializing the Salesforce client", sfdcClient, sfdcClient.stackTrace());
-        return sfdcClient;
-    }
-
+function getEmails(string label) returns Email[]|error {
     gmail:Client|error gmailClient = new (gmailConfig);
     if gmailClient is error {
         log:printError("An error occured while initializing the GMail client", gmailClient, gmailClient.stackTrace());
         return gmailClient;
     }
 
-    string[] labelsToMatch = ["Lead"];
-
-    string[]|error labelIdsToMatch = getLabelIDs(gmailClient, labelsToMatch);
-    if labelIdsToMatch is error {
-        log:printError("An error occured while fetching labels", labelIdsToMatch, labelIdsToMatch.stackTrace(), {"labelsToMatch": labelsToMatch});
-        return labelIdsToMatch;
-    }
-
+    string[] labelIdsToMatch = check getLabelIds(gmailClient, [label]);
     if (labelIdsToMatch.length() == 0) {
         error e = error("Unable to find any labels to match.");
-        log:printError("Unable to find any labels to match.", e, e.stackTrace(), {"labelsToMatch": labelsToMatch});
+        log:printError("Unable to find any labels to match.", e, e.stackTrace(), label = label);
         return e;
     }
 
+    gmail:MailThread[] matchingMailThreads = check getMatchingMailThreads(gmailClient, labelIdsToMatch);
+    removeLabels(gmailClient, matchingMailThreads, labelIdsToMatch);
+
+    gmail:Message[] matchingEmails = getMatchingEmails(gmailClient, matchingMailThreads);
+
+    Email[] emails = [];
+    from gmail:Message message in matchingEmails
+    do {
+        Email|error email = parseEmail(message);
+        if email is Email {
+            emails.push(email);
+        }    
+    };
+    
+    return emails;
+}
+
+function getLabelIds(gmail:Client gmailClient, string[] labelsToMatch) returns string[]|error {
+    gmail:LabelList|error labelList = gmailClient->listLabels("me");
+    if labelList is error {
+        log:printError("An error occured while fetching labels", labelList, labelList.stackTrace(), labelsToMatch = labelsToMatch);
+        return labelList;
+    }
+
+    return from gmail:Label label in labelList.labels
+        where labelsToMatch.indexOf(label.name) != ()
+        select label.id;
+}
+
+function getMatchingMailThreads(gmail:Client gmailClient, string[] labelIdsToMatch) returns gmail:MailThread[]|error {
     gmail:MsgSearchFilter searchFilter = {
         includeSpamTrash: false,
         labelIds: labelIdsToMatch
@@ -101,56 +100,37 @@ function checkForNewLeads() returns error? {
 
     stream<gmail:MailThread, error?>|error mailThreadStream = gmailClient->listThreads(filter = searchFilter);
     if mailThreadStream is error {
-        log:printError("An error occured while retrieving the emails.", mailThreadStream, mailThreadStream.stackTrace(), {"searchFilter": searchFilter});
+        log:printError("An error occured while retrieving the emails.", mailThreadStream, mailThreadStream.stackTrace(), searchFilter = searchFilter);
         return mailThreadStream;
     }
 
-    error? e = check from gmail:MailThread thread in mailThreadStream
-        limit 1
-        do {
-            gmail:MailThread|error response = gmailClient->readThread(thread.id);
-            if response is error {
-                log:printError("An error occured while reading the email.", response, response.stackTrace(), {"threadId": thread.id});
-                return response;
-            }
-
-            Email|error email = parseEmail((<gmail:Message[]>response.messages)[0]);
-            if email is error {
-                log:printError("An error occured while parsing the email.", email, email.stackTrace(), {"threadId": thread.id});
-            } else {
-
-                Lead|error lead = getLead(email.'from, email.subject, email.body);
-                if lead is error {
-                    log:printError("An error occured while attempting to generate lead information.", lead, lead.stackTrace(), {"threadId": thread.id, "email": email});
-                } else {
-
-                    sfdc:CreationResponse|error createResponse = check sfdcClient->create("EmailLead__c", lead);
-                    if createResponse is error {
-                        log:printError("An error occured while creating a Lead object on salesforce.", createResponse, createResponse.stackTrace(), {"threadId": thread.id, "email": email, "lead": lead});
-                    } else {
-
-                        log:printInfo("Lead successfully created.", Lead = lead);
-                        gmail:MailThread|error removeLabelResponse = gmailClient->modifyThread(thread.id, [], labelIdsToMatch);
-                        if removeLabelResponse is error {
-                            log:printError("An error occured in removing the labels from the thread.", removeLabelResponse, removeLabelResponse.stackTrace(), {"threadId": thread.id});
-                        }
-                    }
-                }
-            }
-
-        };
-
-    if e is error {
-        log:printError("An error ocurred in reading the emails.", e, e.stackTrace());
-        return e;
-    }
+    return check from gmail:MailThread mailThread in mailThreadStream
+        select mailThread;
 }
 
-function getLabelIDs(gmail:Client gmailClient, string[] labelsToMatch) returns string[]|error {
-    gmail:LabelList labelList = check gmailClient->listLabels("me");
-    return from gmail:Label label in labelList.labels
-           where labelsToMatch.indexOf(label.name) != ()
-           select label.id;
+function removeLabels(gmail:Client gmailClient, gmail:MailThread[] mailThreads, string[] labelIds) {
+    from gmail:MailThread mailThread in mailThreads
+    do {
+        gmail:MailThread|error removeLabelResponse = gmailClient->modifyThread(mailThread.id, [], labelIds);
+        if removeLabelResponse is error {
+            log:printError("An error occured in removing the labels from the thread.", removeLabelResponse, removeLabelResponse.stackTrace(), threadId = mailThread.id, labelIds = labelIds);
+        }
+    };
+}
+
+function getMatchingEmails(gmail:Client gmailClient, gmail:MailThread[] mailThreads) returns gmail:Message[] {
+    gmail:Message[] messages = [];
+    _ = from gmail:MailThread mailThread in mailThreads
+        do {
+            gmail:MailThread|error response = gmailClient->readThread(mailThread.id);
+            if response is error {
+                log:printError("An error occured while reading the email.", response, response.stackTrace(), threadId = mailThread.id);
+            } else {
+                messages.push((<gmail:Message[]>response.messages)[0]);
+            }
+        };
+
+    return messages;
 }
 
 function parseEmail(gmail:Message message) returns Email|error {
@@ -165,45 +145,63 @@ function parseEmail(gmail:Message message) returns Email|error {
     };
 }
 
-function getLead(string 'from, string subject, string emailBody) returns Lead|error {
-    Name name = check getName('from);
+function generateLead(string 'from, string subject, string body) returns Lead|error {
+    do {
+        openAI:Client openAIClient = check new ({
+            auth: {token: openAIKey}
+        });
 
-    return {
-        ...name,
-        email__c: check getEmailAddress('from),
-        phoneNumber__c: "+94771952226",
-        company__c: subject,
-        designation__c: emailBody
-    };
+        openAI:CreateChatCompletionRequest request = {
+            model: "gpt-3.5-turbo",
+            messages: [
+                {
+                    role: "user",
+                    content: string `
+                Extract the following details in JSON from the email.
+                    {
+                        firstName__c: string, // Mandatory
+                        lastName__c: string, // Mandatory
+                        email__c: string // Mandatory
+                        phoneNumber__c: string, // With country code. Use N/A if unable to find
+                        company__c: string, // Mandatory
+                        designation__c: string // Not mandator. Use N/A if unable to find
+                    }
+
+                Here is the email:    
+                {
+                    from: ${'from},
+                    subject: ${subject},
+                    body: ${body}
+                }
+            `
+                }
+            ]
+        };
+
+        openAI:CreateChatCompletionResponse response = check openAIClient->/chat/completions.post(request);
+
+        Lead result = check (<string>response.choices[0].message?.content).fromJsonStringWithType(Lead);
+        return result;
+    } on fail error e {
+        log:printError("Unable to generate lead.", e, e.stackTrace(), 'from = 'from, subject = subject, body = body);
+        return e;
+    }
 }
 
-function getEmailAddress(string headerFrom) returns string|error {
-    int? startIndex = headerFrom.lastIndexOf("<");
-    int? endIndex = headerFrom.lastIndexOf(">");
-
-    if (startIndex is () || endIndex is ()) {
-        return error("An error ocurred in determining the sender's email address.");
+function addLeadsToSalesforce(Lead[] leads) returns error? {
+    sfdc:Client|error sfdcClient = new (sfdcConfig);
+    if sfdcClient is error {
+        log:printError("An error occured while initializing the Salesforce client", sfdcClient, sfdcClient.stackTrace());
+        return sfdcClient;
     }
 
-    return headerFrom.substring(startIndex + 1, endIndex);
-}
-
-function getName(string headerFrom) returns Name|error {
-    int? firstWhitespaceIndex = headerFrom.indexOf(" ");
-    int? angleBracketIndex = headerFrom.lastIndexOf(" <");
-    if (firstWhitespaceIndex is () || angleBracketIndex is ()) {
-        return error("An error occurred in determining the sender's name.");
-    }
-
-    int? lastWhitespaceIndex = headerFrom.lastIndexOf(" ", angleBracketIndex-1);
-    if (lastWhitespaceIndex is ()) {
-        return error("An error occurred in determining the sender's name.");
-    }
-
-    string firstName = headerFrom.substring(0, firstWhitespaceIndex);
-    string lastName = headerFrom.substring(lastWhitespaceIndex+1, angleBracketIndex);
-    return {
-        firstName__c: firstName,
-        lastName__c: lastName
+    from Lead lead in leads
+    do {
+        sfdc:CreationResponse|error createResponse = check sfdcClient->create("EmailLead__c", lead);
+        if createResponse is error {
+            log:printError("An error occured while creating a Lead object on salesforce.", createResponse, createResponse.stackTrace(), lead = lead);
+        } else {
+            log:printInfo("Lead successfully created.", lead = lead);
+        }
     };
 }
