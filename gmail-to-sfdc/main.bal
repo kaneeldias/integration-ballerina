@@ -45,7 +45,7 @@ public function main() returns error? {
 
         check addLeadsToSalesforce(leads);
 
-        runtime:sleep(10);
+        runtime:sleep(600);
     }
 }
 
