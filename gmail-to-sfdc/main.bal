@@ -50,16 +50,11 @@ public function main() returns error? {
 }
 
 function getEmails(string label) returns Email[]|error {
-    gmail:Client|error gmailClient = new (gmailConfig);
-    if gmailClient is error {
-        log:printError("An error occured while initializing the GMail client", gmailClient, gmailClient.stackTrace());
-        return gmailClient;
-    }
+    gmail:Client gmailClient = check new (gmailConfig);
 
     string[] labelIdsToMatch = check getLabelIds(gmailClient, [label]);
     if (labelIdsToMatch.length() == 0) {
         error e = error("Unable to find any labels to match.");
-        log:printError("Unable to find any labels to match.", e, e.stackTrace(), label = label);
         return e;
     }
 
@@ -81,11 +76,7 @@ function getEmails(string label) returns Email[]|error {
 }
 
 function getLabelIds(gmail:Client gmailClient, string[] labelsToMatch) returns string[]|error {
-    gmail:LabelList|error labelList = gmailClient->listLabels("me");
-    if labelList is error {
-        log:printError("An error occured while fetching labels", labelList, labelList.stackTrace(), labelsToMatch = labelsToMatch);
-        return labelList;
-    }
+    gmail:LabelList labelList = check gmailClient->listLabels("me");
 
     return from gmail:Label label in labelList.labels
         where labelsToMatch.indexOf(label.name) != ()
@@ -100,7 +91,6 @@ function getMatchingMailThreads(gmail:Client gmailClient, string[] labelIdsToMat
 
     stream<gmail:MailThread, error?>|error mailThreadStream = gmailClient->listThreads(filter = searchFilter);
     if mailThreadStream is error {
-        log:printError("An error occured while retrieving the emails.", mailThreadStream, mailThreadStream.stackTrace(), searchFilter = searchFilter);
         return mailThreadStream;
     }
 
@@ -146,54 +136,45 @@ function parseEmail(gmail:Message message) returns Email|error {
 }
 
 function generateLead(string 'from, string subject, string body) returns Lead|error {
-    do {
-        openAI:Client openAIClient = check new ({
-            auth: {token: openAIKey}
-        });
+    openAI:Client openAIClient = check new ({
+        auth: {token: openAIKey}
+    });
 
-        openAI:CreateChatCompletionRequest request = {
-            model: "gpt-3.5-turbo",
-            messages: [
+    openAI:CreateChatCompletionRequest request = {
+        model: "gpt-3.5-turbo",
+        messages: [
+            {
+                role: "user",
+                content: string `
+            Extract the following details in JSON from the email.
                 {
-                    role: "user",
-                    content: string `
-                Extract the following details in JSON from the email.
-                    {
-                        firstName__c: string, // Mandatory
-                        lastName__c: string, // Mandatory
-                        email__c: string // Mandatory
-                        phoneNumber__c: string, // With country code. Use N/A if unable to find
-                        company__c: string, // Mandatory
-                        designation__c: string // Not mandator. Use N/A if unable to find
-                    }
-
-                Here is the email:    
-                {
-                    from: ${'from},
-                    subject: ${subject},
-                    body: ${body}
+                    firstName__c: string, // Mandatory
+                    lastName__c: string, // Mandatory
+                    email__c: string // Mandatory
+                    phoneNumber__c: string, // With country code. Use N/A if unable to find
+                    company__c: string, // Mandatory
+                    designation__c: string // Not mandator. Use N/A if unable to find
                 }
-            `
-                }
-            ]
-        };
 
-        openAI:CreateChatCompletionResponse response = check openAIClient->/chat/completions.post(request);
+            Here is the email:    
+            {
+                from: ${'from},
+                subject: ${subject},
+                body: ${body}
+            }
+        `
+            }
+        ]
+    };
 
-        Lead result = check (<string>response.choices[0].message?.content).fromJsonStringWithType(Lead);
-        return result;
-    } on fail error e {
-        log:printError("Unable to generate lead.", e, e.stackTrace(), 'from = 'from, subject = subject, body = body);
-        return e;
-    }
+    openAI:CreateChatCompletionResponse response = check openAIClient->/chat/completions.post(request);
+
+    Lead result = check (<string>response.choices[0].message?.content).fromJsonStringWithType(Lead);
+    return result;
 }
 
 function addLeadsToSalesforce(Lead[] leads) returns error? {
-    sfdc:Client|error sfdcClient = new (sfdcConfig);
-    if sfdcClient is error {
-        log:printError("An error occured while initializing the Salesforce client", sfdcClient, sfdcClient.stackTrace());
-        return sfdcClient;
-    }
+    sfdc:Client sfdcClient = check new (sfdcConfig);
 
     from Lead lead in leads
     do {
